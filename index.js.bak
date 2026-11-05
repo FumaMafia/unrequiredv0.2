@@ -1,0 +1,368 @@
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers, downloadMediaMessage } = require('@whiskeysockets/baileys');
+const pino = require('pino');
+const qrcode = require('qrcode-terminal');
+const figlet = require('figlet');
+const readline = require('readline');
+const handleAntiCall = require('./anticall');
+
+const messageStore = new Map();
+
+// Stati delle funzioni (globali e per chat)
+let antiCallGlobal = true;
+const disabledAntiCallChats = new Set();
+
+let antiDeleteGlobal = true;
+const disabledAntiDeleteChats = new Set();
+
+const PURPLE = '\x1b[35m';
+const CYAN = '\x1b[36m';
+const GREEN = '\x1b[32m';
+const YELLOW = '\x1b[33m';
+const DIM = '\x1b[2m';
+const RESET = '\x1b[0m';
+
+const askQuestion = (query) => {
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout
+    });
+    return new Promise(resolve => rl.question(query, ans => {
+        rl.close();
+        resolve(ans);
+    }));
+};
+
+async function showStackedBanner() {
+    const text = "FUMA\nANTI-\nCALL\nBOT\nVERS.\n0.2";
+    await new Promise((resolve) => {
+        figlet(text, { font: 'ANSI Shadow', horizontalLayout: 'default' }, async (err, data) => {
+            const output = err ? text : data;
+            const chars = output.split('');
+            const totalTime = 2000; // 2 secondi totali
+            const delay = totalTime / chars.length;
+
+            process.stdout.write(PURPLE);
+            for (let i = 0; i < chars.length; i++) {
+                process.stdout.write(chars[i]);
+                await new Promise(r => setTimeout(r, delay));
+            }
+            process.stdout.write(RESET + '\n');
+            resolve();
+        });
+    });
+    console.log(`${DIM}ultimo aggiornamento 04/11/2026${RESET}\n`);
+}
+
+async function coolProcess(text) {
+    process.stdout.write(CYAN + `[⚡] ${text}` + RESET);
+    for (let i = 0; i < 3; i++) {
+        process.stdout.write(".");
+        await new Promise(r => setTimeout(r, 200));
+    }
+    console.log(GREEN + " [OK]" + RESET);
+}
+
+async function startBot(choice, phoneNumber) {
+    await coolProcess("Inizializzazione moduli di sicurezza");
+    await coolProcess("Verifica file di sessione");
+
+    const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+
+    const sock = makeWASocket({
+        logger: pino({ level: 'silent' }),
+        auth: state,
+        browser: Browsers.ubuntu("Chrome")
+    });
+
+    if (choice === "2" && !sock.authState.creds.registered) {
+        if (!phoneNumber) {
+            console.log(YELLOW + "Numero non valido." + RESET);
+            process.exit(0);
+        }
+        await coolProcess("In attesa della connessione per il codice di associazione");
+        setTimeout(async () => {
+            try {
+                let code = await sock.requestPairingCode(phoneNumber);
+                code = code?.match(/.{1,4}/g)?.join("-") || code;
+                console.log(GREEN + `\n[📌] IL TUO CODICE DI ACCOPPIAMENTO È: ${CYAN}${code}${RESET}\n`);
+                console.log(DIM + "Inseriscilo su WhatsApp andando su: Dispositivi collegati -> Collega un dispositivo -> Collega con il numero di telefono." + RESET);
+            } catch (e) {
+                console.error("Errore nella generazione del codice:", e);
+            }
+        }, 8000);
+    }
+
+    let qrShown = false;
+
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, qr, lastDisconnect } = update;
+        
+        if (choice === "1" && qr && !qrShown) {
+            qrShown = true;
+            console.log(GREEN + "\n[✔] Scansiona il QR Code con WhatsApp:\n" + RESET);
+            qrcode.generate(qr, { small: true });
+        }
+
+        if (connection === 'close') {
+            const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+            console.log('Connessione chiusa, riconnessione in corso...', shouldReconnect);
+            if (shouldReconnect) {
+                qrShown = false;
+                startBot(choice, phoneNumber);
+            }
+        } else if (connection === 'open') {
+            console.log(GREEN + 'anticall-unrq333 connesso con successo!' + RESET);
+        }
+    });
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('call', async (calls) => {
+        if (!antiCallGlobal) return;
+        for (const call of calls) {
+            if (disabledAntiCallChats.has(call.chatId) || disabledAntiCallChats.has(call.from)) {
+                return;
+            }
+        }
+        await handleAntiCall(sock, calls);
+    });
+
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+        try {
+            const m = messages[0];
+            if (!m.message) return;
+
+            if (m.key && m.key.id) {
+                messageStore.set(m.key.id, m);
+                if (messageStore.size > 500) {
+                    const firstKey = messageStore.keys().next().value;
+                    messageStore.delete(firstKey);
+                }
+            }
+
+            const body = m.message.conversation || 
+                         m.message.extendedTextMessage?.text || 
+                         m.message.imageMessage?.caption || 
+                         m.message.videoMessage?.caption || '';
+
+            if (!body.startsWith('.')) return;
+
+            const args = body.slice(1).trim().split(/ +/);
+            const command = args.shift().toLowerCase();
+            const subArg = args.join(' ').toLowerCase();
+
+            const senderJid = m.key.participant || m.key.remoteJid;
+            const rawUserJid = sock.user.id.includes(':') ? sock.user.id.split(':')[0] + '@s.whatsapp.net' : sock.user.id;
+            const isOwner = senderJid === rawUserJid || m.key.fromMe;
+            const chatJid = m.key.remoteJid;
+
+            // Comando .menu dettagliato
+            if (command === 'menu') {
+                const isAntiCallHere = antiCallGlobal && !disabledAntiCallChats.has(chatJid);
+                const isAntiDelHere = antiDeleteGlobal && !disabledAntiDeleteChats.has(chatJid);
+                
+                const menuText = `🤖 *MENU BOT FUMA ANTICALL 333* 🤖\n\n` +
+                    `📌 *Comandi Multimediali (per tutti):*\n` +
+                    `• \`.rivela\` / \`.readvo\` / \`.nocap\` - Rispondi a un media o view once per rivelarlo.\n\n` +
+                    `⚙️ *Comandi di Gestione (Solo Proprietario):*\n` +
+                    `• \`.attiva anticall\` / \`.antielimina\` - Attiva solo in questa chat.\n` +
+                    `• \`.disattiva anticall\` / \`.antielimina\` - Disattiva solo in questa chat.\n` +
+                    `• \`.attiva-all anticall\` / \`.antielimina\` - Attiva globalmente.\n` +
+                    `• \`.disattiva-all anticall\` / \`.antielimina\` - Disattiva globalmente.\n` +
+                    `• \`.total-on\` - Attiva anticall e antielimina ovunque.\n` +
+                    `• \`.total-off\` - Disattiva anticall e antielimina ovunque.\n\n` +
+                    `📊 *Stato attuale in questa chat:*\n` +
+                    `• Anti-Call: ${isAntiCallHere ? '✅ Attivo' : '❌ Disattivo'}\n` +
+                    `• Anti-Elimina: ${isAntiDelHere ? '✅ Attivo' : '❌ Disattivo'}`;
+
+                await sock.sendMessage(chatJid, { text: menuText }, { quoted: m });
+                return;
+            }
+
+            if (command === 'total-on' || command === 'total-off') {
+                if (!isOwner) {
+                    await sock.sendMessage(chatJid, { text: '❌ Solo il proprietario del bot può utilizzare questo comando!' }, { quoted: m });
+                    return;
+                }
+                const status = command === 'total-on';
+                antiCallGlobal = status;
+                antiDeleteGlobal = status;
+                if (status) {
+                    disabledAntiCallChats.clear();
+                    disabledAntiDeleteChats.clear();
+                }
+
+                await sock.sendMessage(chatJid, { text: `🚀 *TOTAL:* Anticall e Antielimina ${status ? 'attivati' : 'disattivati'} con successo ovunque!` }, { quoted: m });
+                return;
+            }
+
+            if (['attiva', 'disattiva', 'attiva-all', 'disattiva-all'].includes(command)) {
+                if (!isOwner) {
+                    await sock.sendMessage(chatJid, { text: '❌ Solo il proprietario del bot può utilizzare questo comando!' }, { quoted: m });
+                    return;
+                }
+
+                const isGlobal = command.includes('-all');
+                const status = command.startsWith('attiva');
+
+                if (subArg.includes('anticall') || subArg.includes('antichiamate')) {
+                    if (isGlobal) {
+                        antiCallGlobal = status;
+                        if (status) disabledAntiCallChats.clear();
+                    } else {
+                        if (status) {
+                            disabledAntiCallChats.delete(chatJid);
+                        } else {
+                            disabledAntiCallChats.add(chatJid);
+                        }
+                    }
+                    const activeState = isGlobal ? antiCallGlobal : (antiCallGlobal && !disabledAntiCallChats.has(chatJid));
+                    await sock.sendMessage(chatJid, { text: `⚙️ Anticall ${activeState ? 'attivato' : 'disattivato'} ${isGlobal ? 'globalmente' : 'in questa chat'}.` }, { quoted: m });
+                    return;
+                }
+
+                if (subArg.includes('antielimina')) {
+                    if (isGlobal) {
+                        antiDeleteGlobal = status;
+                        if (status) disabledAntiDeleteChats.clear();
+                    } else {
+                        if (status) {
+                            disabledAntiDeleteChats.delete(chatJid);
+                        } else {
+                            disabledAntiDeleteChats.add(chatJid);
+                        }
+                    }
+                    const activeState = isGlobal ? antiDeleteGlobal : (antiDeleteGlobal && !disabledAntiDeleteChats.has(chatJid));
+                    await sock.sendMessage(chatJid, { text: `⚙️ Antielimina ${activeState ? 'attivato' : 'disattivato'} ${isGlobal ? 'globalmente' : 'in questa chat'}.` }, { quoted: m });
+                    return;
+                }
+            }
+
+            const validCommands = ['rivela', 'readvo', 'readviewonce', 'read', 'nocap'];
+
+            if (validCommands.includes(command)) {
+                const quotedContext = m.message.extendedTextMessage?.contextInfo;
+                const quotedMsg = quotedContext?.quotedMessage;
+
+                if (!quotedMsg) {
+                    await sock.sendMessage(chatJid, { text: '📍 Per favore, rispondi (quota) a un messaggio multimediale, vocale o View Once!' }, { quoted: m });
+                    return;
+                }
+
+                try {
+                    const quotedKey = {
+                        remoteJid: chatJid,
+                        id: quotedContext.stanzaId,
+                        participant: quotedContext.participant
+                    };
+
+                    let buffer = await downloadMediaMessage(
+                        { key: quotedKey, message: quotedMsg },
+                        'buffer',
+                        {},
+                        { logger: sock.logger, reuploadRequest: sock.updateMediaMessage }
+                    );
+
+                    const isVideo = quotedMsg.videoMessage || 
+                                    quotedMsg.viewOnceMessageV2?.message?.videoMessage || 
+                                    quotedMsg.viewOnceMessage?.message?.videoMessage ||
+                                    quotedMsg.documentWithCaptionMessage?.message?.documentMessage?.mimetype?.includes('video');
+
+                    const isAudio = quotedMsg.audioMessage || 
+                                    quotedMsg.viewOnceMessageV2?.message?.audioMessage ||
+                                    quotedMsg.viewOnceMessage?.message?.audioMessage ||
+                                    quotedMsg.documentWithCaptionMessage?.message?.documentMessage?.mimetype?.includes('audio');
+
+                    const isGroup = chatJid.endsWith('@g.us');
+                    const targetDestination = isGroup ? chatJid : rawUserJid;
+
+                    let sendOptions = {};
+
+                    if (isVideo) {
+                        sendOptions = { video: buffer, caption: '📸 ecco il file rivelato' };
+                    } else if (isAudio) {
+                        sendOptions = { audio: buffer, mimetype: 'audio/mp4', ptt: true }; 
+                    } else {
+                        sendOptions = { image: buffer, caption: '📸 ecco il file rivelato' };
+                    }
+
+                    await sock.sendMessage(chatJid, {
+                        react: { text: '✅', key: m.key }
+                    });
+
+                    await sock.sendMessage(targetDestination, sendOptions);
+
+                } catch (err) {
+                    console.error('Errore durante il download del media:', err);
+                    await sock.sendMessage(chatJid, { text: '❌ Errore durante il download del file multimediale o audio.' }, { quoted: m });
+                }
+            }
+        } catch (e) {
+            console.error('Errore nel gestore dei messaggi:', e);
+        }
+    });
+
+    sock.ev.on('messages.update', async (chatUpdates) => {
+        for (const update of chatUpdates) {
+            if (update.update && update.update.message === null) {
+                try {
+                    const messageKey = update.key;
+                    const chatJid = messageKey.remoteJid;
+
+                    if (!antiDeleteGlobal || disabledAntiDeleteChats.has(chatJid)) return;
+
+                    const cachedMessage = messageStore.get(messageKey.id);
+                    if (!cachedMessage || !cachedMessage.message) return;
+
+                    if (cachedMessage.key && cachedMessage.key.fromMe) return;
+
+                    const isGroup = chatJid.endsWith('@g.us');
+                    const targetDestination = chatJid;
+
+                    const senderJid = messageKey.participant || chatJid;
+                    const rawNumber = senderJid.split('@')[0];
+                    const formattedSender = rawNumber.length <= 13 ? `+${rawNumber}` : `ID: ${rawNumber}`;
+                    
+                    const timeNow = new Date().toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });
+
+                    const msgContent = cachedMessage.message;
+                    const text = msgContent.conversation || 
+                                 msgContent.extendedTextMessage?.text || 
+                                 msgContent.imageMessage?.caption || 
+                                 msgContent.videoMessage?.caption || '';
+
+                    if (isGroup) {
+                        await sock.sendMessage(targetDestination, {
+                            text: `🚨 *ANTI-ELIMINAZIONE*\n👤 *Eliminato da:* ${formattedSender}\n⏰ *Alle:* ${timeNow}\n\n💬 *Contenuto:* ${text || '[Messaggio multimediale]'}`
+                        });
+                    } else {
+                        await sock.sendMessage(targetDestination, {
+                            text: `🚨 *ANTI-ELIMINAZIONE*\n⏰ *Alle:* ${timeNow}\n\n💬 *Contenuto:* ${text || '[Messaggio multimediale]'}`
+                        });
+                    }
+                } catch (err) {
+                    console.error('Errore anti-eliminazione:', err);
+                }
+            }
+        }
+    });
+}
+
+(async () => {
+    await showStackedBanner();
+
+    console.log(YELLOW + "Scegli il metodo di collegamento a WhatsApp:" + RESET);
+    console.log("1. Codice QR");
+    console.log("2. Numero di Telefono (Pairing Code)");
+    
+    let choice = await askQuestion(CYAN + "\nInserisci il numero della scelta (1 o 2): " + RESET);
+    choice = choice.trim();
+
+    let phoneNumber = "";
+    if (choice === "2") {
+        phoneNumber = await askQuestion(YELLOW + "Inserisci il tuo numero WhatsApp (es. 393471234567): " + RESET);
+        phoneNumber = phoneNumber.replace(/[^0-9]/g, "");
+    }
+
+    startBot(choice, phoneNumber);
+})();
